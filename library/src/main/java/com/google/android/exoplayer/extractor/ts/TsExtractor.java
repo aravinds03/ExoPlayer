@@ -15,6 +15,7 @@
  */
 package com.google.android.exoplayer.extractor.ts;
 
+import com.google.android.exoplayer.extractor.DummyTrackOutput;
 import com.google.android.exoplayer.extractor.Extractor;
 import com.google.android.exoplayer.extractor.ExtractorInput;
 import com.google.android.exoplayer.extractor.ExtractorOutput;
@@ -45,6 +46,8 @@ public final class TsExtractor implements Extractor {
   private static final int TS_STREAM_TYPE_MPA_LSF = 0x04;
   private static final int TS_STREAM_TYPE_AAC = 0x0F;
   private static final int TS_STREAM_TYPE_AC3 = 0x81;
+  private static final int TS_STREAM_TYPE_DTS = 0x8A;
+  private static final int TS_STREAM_TYPE_HDMV_DTS = 0x82;
   private static final int TS_STREAM_TYPE_E_AC3 = 0x87;
   private static final int TS_STREAM_TYPE_H262 = 0x02;
   private static final int TS_STREAM_TYPE_H264 = 0x1B;
@@ -220,9 +223,14 @@ public final class TsExtractor implements Extractor {
       int programCount = (sectionLength - 9) / 4;
       for (int i = 0; i < programCount; i++) {
         data.readBytes(patScratch, 4);
-        patScratch.skipBits(19); // program_number (16), reserved (3)
-        int pid = patScratch.readBits(13);
-        tsPayloadReaders.put(pid, new PmtReader());
+        int programNumber = patScratch.readBits(16);
+        patScratch.skipBits(3); // reserved (3)
+        if (programNumber == 0) {
+          patScratch.skipBits(13); // network_PID (13)
+        } else {
+          int pid = patScratch.readBits(13);
+          tsPayloadReaders.put(pid, new PmtReader());
+        }
       }
 
       // Skip CRC_32.
@@ -320,7 +328,7 @@ public final class TsExtractor implements Extractor {
           continue;
         }
 
-        ElementaryStreamReader pesPayloadReader = null;
+        ElementaryStreamReader pesPayloadReader;
         switch (streamType) {
           case TS_STREAM_TYPE_MPA:
             pesPayloadReader = new MpegAudioReader(output.track(TS_STREAM_TYPE_MPA));
@@ -329,13 +337,18 @@ public final class TsExtractor implements Extractor {
             pesPayloadReader = new MpegAudioReader(output.track(TS_STREAM_TYPE_MPA_LSF));
             break;
           case TS_STREAM_TYPE_AAC:
-            pesPayloadReader = new AdtsReader(output.track(TS_STREAM_TYPE_AAC));
+            pesPayloadReader = new AdtsReader(output.track(TS_STREAM_TYPE_AAC),
+                new DummyTrackOutput());
             break;
           case TS_STREAM_TYPE_AC3:
             pesPayloadReader = new Ac3Reader(output.track(TS_STREAM_TYPE_AC3), false);
             break;
           case TS_STREAM_TYPE_E_AC3:
             pesPayloadReader = new Ac3Reader(output.track(TS_STREAM_TYPE_E_AC3), true);
+            break;
+          case TS_STREAM_TYPE_DTS:
+          case TS_STREAM_TYPE_HDMV_DTS:
+            pesPayloadReader = new DtsReader(output.track(TS_STREAM_TYPE_DTS));
             break;
           case TS_STREAM_TYPE_H262:
             pesPayloadReader = new H262Reader(output.track(TS_STREAM_TYPE_H262));
@@ -350,6 +363,9 @@ public final class TsExtractor implements Extractor {
             break;
           case TS_STREAM_TYPE_ID3:
             pesPayloadReader = id3Reader;
+            break;
+          default:
+            pesPayloadReader = null;
             break;
         }
 
@@ -387,7 +403,14 @@ public final class TsExtractor implements Extractor {
             streamType = TS_STREAM_TYPE_H265;
           }
           break;
+        } else if (descriptorTag == 0x6A) { // AC-3_descriptor in DVB (ETSI EN 300 468)
+          streamType = TS_STREAM_TYPE_AC3;
+        } else if (descriptorTag == 0x7A) { // enhanced_AC-3_descriptor
+          streamType = TS_STREAM_TYPE_E_AC3;
+        } else if (descriptorTag == 0x7B) { // DTS_descriptor
+          streamType = TS_STREAM_TYPE_DTS;
         }
+
         data.skipBytes(descriptorLength);
       }
       data.setPosition(descriptorsEndPosition);
@@ -415,13 +438,13 @@ public final class TsExtractor implements Extractor {
 
     private int state;
     private int bytesRead;
-    private boolean bodyStarted;
 
     private boolean ptsFlag;
     private boolean dtsFlag;
     private boolean seenFirstDts;
     private int extendedHeaderLength;
     private int payloadSize;
+    private boolean dataAlignmentIndicator;
     private long timeUs;
 
     public PesReader(ElementaryStreamReader pesPayloadReader) {
@@ -434,7 +457,6 @@ public final class TsExtractor implements Extractor {
     public void seek() {
       state = STATE_FINDING_HEADER;
       bytesRead = 0;
-      bodyStarted = false;
       seenFirstDts = false;
       pesPayloadReader.seek();
     }
@@ -459,10 +481,8 @@ public final class TsExtractor implements Extractor {
             if (payloadSize != -1) {
               Log.w(TAG, "Unexpected start indicator: expected " + payloadSize + " more bytes");
             }
-            // Either way, if the body was started, notify the reader that it has now finished.
-            if (bodyStarted) {
-              pesPayloadReader.packetFinished();
-            }
+            // Either way, notify the reader that it has now finished.
+            pesPayloadReader.packetFinished();
             break;
         }
         setState(STATE_READING_HEADER);
@@ -484,7 +504,7 @@ public final class TsExtractor implements Extractor {
             if (continueRead(data, pesScratch.data, readLength)
                 && continueRead(data, null, extendedHeaderLength)) {
               parseHeaderExtension();
-              bodyStarted = false;
+              pesPayloadReader.packetStarted(timeUs, dataAlignmentIndicator);
               setState(STATE_READING_BODY);
             }
             break;
@@ -495,8 +515,7 @@ public final class TsExtractor implements Extractor {
               readLength -= padding;
               data.setLimit(data.getPosition() + readLength);
             }
-            pesPayloadReader.consume(data, timeUs, !bodyStarted);
-            bodyStarted = true;
+            pesPayloadReader.consume(data);
             if (payloadSize != -1) {
               payloadSize -= readLength;
               if (payloadSize == 0) {
@@ -549,9 +568,9 @@ public final class TsExtractor implements Extractor {
 
       pesScratch.skipBits(8); // stream_id.
       int packetLength = pesScratch.readBits(16);
-      // First 8 bits are skipped: '10' (2), PES_scrambling_control (2), PES_priority (1),
-      // data_alignment_indicator (1), copyright (1), original_or_copy (1)
-      pesScratch.skipBits(8);
+      pesScratch.skipBits(5); // '10' (2), PES_scrambling_control (2), PES_priority (1)
+      dataAlignmentIndicator = pesScratch.readBit();
+      pesScratch.skipBits(2); // copyright (1), original_or_copy (1)
       ptsFlag = pesScratch.readBit();
       dtsFlag = pesScratch.readBit();
       // ESCR_flag (1), ES_rate_flag (1), DSM_trick_mode_flag (1),
